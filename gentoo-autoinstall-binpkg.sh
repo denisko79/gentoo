@@ -23,6 +23,7 @@ success() { echo -e "${GREEN}✓ $1${NC}"; }
 # --- AUTO-DETECT MAIN DISK ---
 find_main_disk() {
     local disks=()
+    local size_bytes=""
     local size_gb=""
     local candidate=""
 
@@ -31,9 +32,18 @@ find_main_disk() {
         [[ ! -b "$dev" ]] && continue
         [[ "$dev" =~ ^(\/dev\/loop|\/dev\/ram|\/dev\/sr|\/dev\/md) ]] && continue
 
-        # Get size in GB
-        size_gb=$(blockdev --getsize64 "$dev" 2>/dev/null | awk '{printf "%.0f", $1/1073741824}')
-        if [[ -n "$size_gb" && "$size_gb" -ge 20 ]]; then
+        # Get size in bytes
+        size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null)
+        if [[ -z "$size_bytes" || "$size_bytes" -eq 0 ]]; then
+            log "⚠️  Skipping $dev: blockdev returned empty or 0"
+            continue
+        fi
+
+        # Convert to GB (1 GiB = 1073741824 bytes)
+        size_gb=$((size_bytes / 1073741824))
+        log "🔍 $dev: $size_bytes bytes ($size_gb GB)"
+
+        if [[ "$size_gb" -ge 20 ]]; then
             disks+=("$dev ($size_gb GB)")
             if [[ -z "$candidate" ]]; then
                 candidate="$dev"
@@ -42,13 +52,27 @@ find_main_disk() {
     done
 
     if [[ ${#disks[@]} -eq 0 ]]; then
-        error "No suitable disk found. Need at least 20GB. Available disks:"
-        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || echo "lsblk failed"
+        error "No suitable disk found. Need at least 20GB."
+        echo
+        echo "📋 Available disks and their sizes (debug info):"
+        for dev in /dev/sd* /dev/nvme* /dev/vd* /dev/xvd* /dev/mmcblk*; do
+            [[ ! -b "$dev" ]] && continue
+            [[ "$dev" =~ ^(\/dev\/loop|\/dev\/ram|\/dev\/sr|\/dev\/md) ]] && continue
+            size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null)
+            if [[ -n "$size_bytes" ]]; then
+                size_gb=$((size_bytes / 1073741824))
+                echo "   $dev: $size_bytes bytes ($size_gb GB)"
+            else
+                echo "   $dev: UNKNOWN (blockdev failed)"
+            fi
+        done
+        echo
+        error "Please ensure your target disk is connected and recognized by the system."
         exit 1
     fi
 
     if [[ ${#disks[@]} -eq 1 ]]; then
-        log "Auto-detected main disk: ${disks[0]}"
+        log "✅ Auto-detected main disk: ${disks[0]}"
         echo "$candidate"
         return 0
     fi
@@ -63,7 +87,7 @@ find_main_disk() {
             *[0-9]* )
                 if [[ $REPLY -ge 1 && $REPLY -le ${#disks[@]} ]]; then
                     choice_path=$(echo "${disks[$((REPLY-1))]}" | cut -d' ' -f1)
-                    log "Selected disk: $choice_path"
+                    log "✅ Selected disk: $choice_path"
                     echo "$choice_path"
                     return 0
                 fi
