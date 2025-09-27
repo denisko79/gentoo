@@ -1,26 +1,11 @@
 #!/bin/bash
 # ======================================================================
-# AUTOINSTALL GENTOO WITH CHOICES: systemd/openrc, btrfs/subvol, zfs-root, systemd-boot + efistub
-# + AUTOMATIC MIRROR SELECTION + BINARY PACKAGE INSTALLATION (BINPKG)
-# Run from Gentoo LiveCD with internet access and partitioned disk (e.g. /dev/nvme0n1)
+# FULLY FIXED GENTOO AUTOINSTALL: DISK AUTO-DETECTION + BINPKG + SYSTEMD-BOOT + ZFS/BTRFS
+# Run from Gentoo LiveCD (with internet) as root.
+# Supports: NVMe, SATA, VPS (vda/xvda), eMMC (mmcblk), USB drives.
 # ======================================================================
 
 set -e
-
-# --- CONFIGURATION ---
-DISK="/dev/nvme0n1"           # CHANGE THIS TO YOUR DISK!
-BOOT_SIZE="512M"
-SWAP_SIZE="4G"
-ROOT_SIZE="rest"
-
-EFI_PARTITION="${DISK}p1"
-SWAP_PARTITION="${DISK}p2"
-ROOT_PARTITION="${DISK}p3"
-
-# BINPKG CONFIG (use official Gentoo binary repository)
-BINPKG_HOST="https://binpkg.gentoo.org"
-BINPKG_ARCH="amd64"
-BINPKG_USE="hardened"  # or "default"
 
 # --- COLORS ---
 RED='\033[0;31m'
@@ -41,10 +26,10 @@ find_main_disk() {
     local size_gb=""
     local candidate=""
 
-    # List all block devices (exclude loop, ram, sr)
-    for dev in /dev/sd* /dev/nvme*; do
+    # Scan all possible block devices
+    for dev in /dev/sd* /dev/nvme* /dev/vd* /dev/xvd* /dev/mmcblk*; do
         [[ ! -b "$dev" ]] && continue
-        [[ "$dev" =~ ^(\/dev\/loop|\/dev\/ram|\/dev\/sr) ]] && continue
+        [[ "$dev" =~ ^(\/dev\/loop|\/dev\/ram|\/dev\/sr|\/dev\/md) ]] && continue
 
         # Get size in GB
         size_gb=$(blockdev --getsize64 "$dev" 2>/dev/null | awk '{printf "%.0f", $1/1073741824}')
@@ -68,7 +53,7 @@ find_main_disk() {
         return 0
     fi
 
-    # Multiple disks — ask user to choose
+    # Multiple disks — let user choose
     log "Multiple disks found. Please choose one:"
     select choice in "${disks[@]}" "Cancel"; do
         case $REPLY in
@@ -77,7 +62,6 @@ find_main_disk() {
                 ;;
             *[0-9]* )
                 if [[ $REPLY -ge 1 && $REPLY -le ${#disks[@]} ]]; then
-                    # Extract device path (e.g., "/dev/nvme0n1" from "/dev/nvme0n1 (512 GB)")
                     choice_path=$(echo "${disks[$((REPLY-1))]}" | cut -d' ' -f1)
                     log "Selected disk: $choice_path"
                     echo "$choice_path"
@@ -199,7 +183,7 @@ install_stage3_binpkg() {
     # Copy resolv.conf
     cp --dereference /etc/resolv.conf /mnt/gentoo/etc/
 
-    # Mount filesystems
+    # Mount essential filesystems
     mount --types proc /proc /mnt/gentoo/proc
     mount --rbind /sys /mnt/gentoo/sys
     mount --make-rslave /mnt/gentoo/sys
@@ -227,24 +211,13 @@ configure_chroot() {
     log "Entering chroot and configuring system..."
 
     chroot /mnt/gentoo /bin/bash << 'EOF'
-    # Sync portage and install essentials
     emerge --sync
     emerge -q sys-apps/portage
-
-    # Install kernel and firmware
     emerge -q sys-kernel/gentoo-sources sys-kernel/linux-firmware
-
-    # Install bootloader tools
     emerge -q sys-boot/systemd-boot sys-apps/dracut sys-apps/efibootmgr
-
-    # Install base utilities
     emerge -q sys-apps/util-linux sys-apps/smartmontools sys-apps/pciutils
     emerge -q net-misc/dhcpcd
-
-    # Install sudo and basic tools
     emerge -q sys-apps/sudo
-
-    # Install systemd or openrc (later)
 EOF
 
     success "Base system installed via binpkg (where available)."
@@ -254,7 +227,6 @@ install_bootloader() {
     log "Installing systemd-boot with efistub..."
 
     chroot /mnt/gentoo /bin/bash << 'EOF'
-    # Build kernel
     cd /usr/src/linux
     make defconfig
     make -j$(nproc)
@@ -262,14 +234,11 @@ install_bootloader() {
     cp arch/x86_64/boot/bzImage /boot/vmlinuz-gentoo
     cp .config /boot/config-gentoo
 
-    # Generate initramfs (with ZFS/BTRFS support)
     emerge -q sys-apps/dracut
     dracut --force --add-drivers "efi_runtime" --no-hostonly /boot/initramfs-gentoo.img
 
-    # Install systemd-boot
     bootctl install
 
-    # Create boot entry
     cat > /boot/loader/entries/gentoo.conf << 'EOL'
 title   Gentoo Linux
 linux   /vmlinuz-gentoo
@@ -278,7 +247,7 @@ options root=ZFS=rpool/root/gentoo rw rootflags=subvol=@ rootfstype=zfs
 EOL
 EOF
 
-    # Inject correct root line based on FS type
+    # Inject correct root= line based on FS type
     if [ "$FS_TYPE" = "btrfs" ]; then
         ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PARTITION")
         sed -i "s|root=ZFS=.*|root=UUID=$ROOT_UUID rw rootflags=subvol=@ rootfstype=btrfs|" /mnt/gentoo/boot/loader/entries/gentoo.conf
@@ -380,34 +349,40 @@ main_menu() {
     log "Using binary packages from: $BINPKG_HOST"
 }
 
+# --- CONFIGURATION ---
+DISK=""                       # ← WILL BE SET BY check_disk()
+BOOT_SIZE="512M"
+SWAP_SIZE="4G"
+EFI_PARTITION="${DISK}p1"
+SWAP_PARTITION="${DISK}p2"
+ROOT_PARTITION="${DISK}p3"
+
+BINPKG_HOST="https://binpkg.gentoo.org"
+BINPKG_ARCH="amd64"
+BINPKG_USE="hardened"
+
 # --- MAIN ---
-main() {
-    check_root
-    check_disk
+check_root
+check_disk
+main_menu
 
-    main_menu
+# --- INSTALLATION STEPS ---
+partition_disk
 
-    partition_disk
+if [ "$FS_TYPE" = "btrfs" ]; then
+    setup_btrfs
+elif [ "$FS_TYPE" = "zfs" ]; then
+    setup_zfs
+fi
 
-    if [ "$FS_TYPE" = "btrfs" ]; then
-        setup_btrfs
-    elif [ "$FS_TYPE" = "zfs" ]; then
-        setup_zfs
-    fi
+install_stage3_binpkg
+select_fastest_mirror
+configure_chroot
+install_bootloader
+configure_init_system
+configure_network
+finalize
 
-    install_stage3_binpkg
-
-    select_fastest_mirror
-
-    configure_chroot
-
-    install_bootloader
-
-    configure_init_system
-
-    configure_network
-
-    finalize
-}
-
-main
+echo
+echo -e "${GREEN}✅ Installation completed successfully!${NC}"
+echo -e "${YELLOW}Reboot now: reboot${NC}"
