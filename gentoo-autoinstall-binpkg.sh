@@ -35,6 +35,59 @@ warn() { echo -e "${YELLOW}!! $1${NC}"; }
 error() { echo -e "${RED}✗ $1${NC}"; exit 1; }
 success() { echo -e "${GREEN}✓ $1${NC}"; }
 
+# --- AUTO-DETECT MAIN DISK ---
+find_main_disk() {
+    local disks=()
+    local size_gb=""
+    local candidate=""
+
+    # List all block devices (exclude loop, ram, sr)
+    for dev in /dev/sd* /dev/nvme*; do
+        [[ ! -b "$dev" ]] && continue
+        [[ "$dev" =~ ^(\/dev\/loop|\/dev\/ram|\/dev\/sr) ]] && continue
+
+        # Get size in GB
+        size_gb=$(blockdev --getsize64 "$dev" 2>/dev/null | awk '{printf "%.0f", $1/1073741824}')
+        if [[ -n "$size_gb" && "$size_gb" -ge 20 ]]; then
+            disks+=("$dev ($size_gb GB)")
+            if [[ -z "$candidate" ]]; then
+                candidate="$dev"
+            fi
+        fi
+    done
+
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        error "No suitable disk found. Need at least 20GB. Available disks:"
+        lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null || echo "lsblk failed"
+        exit 1
+    fi
+
+    if [[ ${#disks[@]} -eq 1 ]]; then
+        log "Auto-detected main disk: ${disks[0]}"
+        echo "$candidate"
+        return 0
+    fi
+
+    # Multiple disks — ask user to choose
+    log "Multiple disks found. Please choose one:"
+    select choice in "${disks[@]}" "Cancel"; do
+        case $REPLY in
+            $(( ${#disks[@]} + 1 )) )
+                error "Installation cancelled."
+                ;;
+            *[0-9]* )
+                if [[ $REPLY -ge 1 && $REPLY -le ${#disks[@]} ]]; then
+                    # Extract device path (e.g., "/dev/nvme0n1" from "/dev/nvme0n1 (512 GB)")
+                    choice_path=$(echo "${disks[$((REPLY-1))]}" | cut -d' ' -f1)
+                    log "Selected disk: $choice_path"
+                    echo "$choice_path"
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
 # --- CHECKS ---
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -43,9 +96,7 @@ check_root() {
 }
 
 check_disk() {
-    if [ ! -b "$DISK" ]; then
-        error "Disk $DISK not found!"
-    fi
+    DISK=$(find_main_disk)
     warn "This will ERASE ALL DATA on $DISK!"
     read -p "Continue? (y/N): " -r
     [[ ! $REPLY =~ ^[Yy]$ ]] && error "Aborted."
