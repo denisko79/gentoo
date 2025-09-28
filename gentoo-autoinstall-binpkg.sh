@@ -128,21 +128,35 @@ fi
 mkdir -p /mnt/gentoo/boot/efi
 mount "$EFI_PART" /mnt/gentoo/boot/efi
 
-# === 3. Загрузка stage3 ===
-log "Загрузка stage3..."
+# === 3. Загрузка stage3 (надёжная версия 2025) ===
+log "Загрузка stage3 для профиля: $PROFILE..."
 
 cd /mnt/gentoo
 
-PROFILE="default"
-[ "$INIT" = "systemd" ] && PROFILE="systemd"
-
+# URL списка
 LISTING_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-${PROFILE}.txt"
-STAGE3_FILE=$(curl -s "$LISTING_URL" | grep -v "^#" | head -n1 | cut -d' ' -f1)
-[ -z "$STAGE3_FILE" ] && error "Не удалось получить URL stage3"
 
-wget -q "https://distfiles.gentoo.org/releases/amd64/autobuilds/$STAGE3_FILE" -O stage3.tar.xz
+# Получаем имя файла (первая непустая строка без #)
+STAGE3_FILE=$(curl -s "$LISTING_URL" | grep -v '^#' | head -n1 | awk '{print $1}')
+if [ -z "$STAGE3_FILE" ] || [ "$STAGE3_FILE" = "" ]; then
+    error "Не удалось определить имя stage3 из $LISTING_URL"
+fi
+
+log "Найден stage3: $STAGE3_FILE"
+
+# Полный URL
+FULL_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/$STAGE3_FILE"
+
+# Скачиваем
+if ! wget -q --show-progress "$FULL_URL" -O stage3.tar.xz; then
+    error "Не удалось скачать stage3. Проверьте интернет и доступность Gentoo-зеркал."
+fi
+
+# Распаковка
+log "Распаковка stage3..."
 tar xpf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
-rm stage3.tar.xz
+rm -f stage3.tar.xz
+log "Stage3 успешно установлен."
 
 # === 4. fstab и базовая настройка ===
 cat > /mnt/gentoo/etc/fstab <<EOF
