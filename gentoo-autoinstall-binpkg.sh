@@ -4,7 +4,6 @@ set -euo pipefail
 # === Настройки ===
 DISK="/dev/sda"
 EFI_SIZE="512M"
-SWAP_SIZE="4G"
 
 # Цвета
 RED='\033[0;31m'
@@ -16,23 +15,25 @@ log() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
 
-# === Умная проверка: LiveCD или установленная система? ===
+# === Отключаем swap и размонтируем старые разделы (для повторного запуска) ===
+swapoff -a 2>/dev/null || true
+umount /dev/sda* 2>/dev/null || true
+umount /mnt/gentoo* 2>/dev/null || true
+
+# === Проверка: LiveCD или установленная система? ===
 detect_live_environment() {
     ROOT_FS_TYPE=$(findmnt -n -o FSTYPE / 2>/dev/null || echo "unknown")
-    ROOT_SOURCE=$(findmnt -n -o SOURCE / 2>/dev/null || echo "unknown")
-
     log "Тип корневой ФС: $ROOT_FS_TYPE"
-    log "Источник корня: $ROOT_SOURCE"
 
     case "$ROOT_FS_TYPE" in
         squashfs|overlay|tmpfs|ramfs|cramfs|iso9660)
-            log "✅ Обнаружена LiveCD-среда — продолжаем установку."
+            log "✅ Обнаружена LiveCD-среда — продолжаем."
             ;;
-        ext4|ext3|ext2|btrfs|xfs|zfs|f2fs)
-            error "Корневая ФС — $ROOT_FS_TYPE ($ROOT_SOURCE). Это НЕ LiveCD! Загрузитесь с установочного носителя."
+        ext4|ext3|btrfs|xfs|zfs|f2fs)
+            error "Корневая ФС — $ROOT_FS_TYPE. Это НЕ LiveCD! Загрузитесь с установочного носителя."
             ;;
         *)
-            warn "Неизвестный тип ФС: $ROOT_FS_TYPE. Возможно, вы не в LiveCD."
+            warn "Неизвестный тип ФС: $ROOT_FS_TYPE. Убедитесь, что вы в LiveCD."
             read -p "Продолжить установку (весь $DISK будет стёрт)? (y/N): " -n 1 -r
             echo
             [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
@@ -44,7 +45,7 @@ detect_live_environment
 
 # === Проверка UEFI ===
 if [ ! -d /sys/firmware/efi ]; then
-    error "Требуется UEFI. Legacy BIOS не поддерживается этим скриптом."
+    error "Требуется UEFI. Legacy BIOS не поддерживается."
 fi
 
 # === Выбор конфигурации ===
@@ -54,7 +55,7 @@ select INIT in "systemd" "openrc"; do
     echo "Неверный выбор"
 done
 
-log "Выберите тип корневой файловой системы:"
+log "Выберите тип корневой ФС:"
 select FS in "btrfs-subvol" "zfs-root"; do
     [[ "$FS" == "btrfs-subvol" || "$FS" == "zfs-root" ]] && break
     echo "Неверный выбор"
@@ -68,8 +69,8 @@ fi
 
 log "Конфигурация: init=$INIT, fs=$FS, bootloader=$BOOTLOADER"
 
-# === 1. Разметка диска ===
-log "Очистка и разметка $DISK..."
+# === 1. Разметка диска (БЕЗ swap) ===
+log "Очистка и разметка $DISK (только EFI + корень)..."
 
 sgdisk --zap-all "$DISK" &>/dev/null || true
 sleep 2
@@ -79,17 +80,15 @@ if [ "$FS" = "zfs-root" ]; then
     sgdisk -n 2:0:0       -t 2:bf00 -c 2:"ZFS" "$DISK"
 else
     sgdisk -n 1:0:+$EFI_SIZE -t 1:ef00 -c 1:"EFI" "$DISK"
-    sgdisk -n 2:0:+$SWAP_SIZE -t 2:8200 -c 2:"swap" "$DISK"
-    sgdisk -n 3:0:0        -t 3:8300 -c 3:"root" "$DISK"
+    sgdisk -n 2:0:0        -t 2:8300 -c 2:"root" "$DISK"
 fi
 
 partprobe "$DISK"
 sleep 3
 
-# === 2. Форматирование и монтирование ===
+# === 2. Форматирование и монтирование (БЕЗ swap) ===
 EFI_PART="${DISK}1"
-SWAP_PART="${DISK}2"
-ROOT_PART="${DISK}3"
+ROOT_PART="${DISK}2"
 ZFS_PART="${DISK}2"
 
 if [ "$FS" = "zfs-root" ]; then
@@ -110,18 +109,15 @@ if [ "$FS" = "zfs-root" ]; then
     mount -t zfs rpool/home /mnt/gentoo/home
 else
     mkfs.vfat -F32 "$EFI_PART"
-    mkswap "$SWAP_PART"
-    swapon "$SWAP_PART"
     mkfs.btrfs -f "$ROOT_PART"
 
-    # Создаём временную точку монтирования
     mkdir -p /mnt/btrfs-tmp
     mount "$ROOT_PART" /mnt/btrfs-tmp
 
     btrfs subvolume create /mnt/btrfs-tmp/@
     btrfs subvolume create /mnt/btrfs-tmp/@home
     umount /mnt/btrfs-tmp
-    rmdir /mnt/btrfs-tmp  # опционально: удаляем после использования
+    rmdir /mnt/btrfs-tmp
 
     mkdir -p /mnt/gentoo
     mount -o subvol=@,compress=zstd,noatime "$ROOT_PART" /mnt/gentoo
@@ -164,11 +160,6 @@ fi
 
 UUID_EFI=$(blkid -s UUID -o value "$EFI_PART")
 echo "UUID=$UUID_EFI  /boot/efi       vfat    defaults                0 2" >> /mnt/gentoo/etc/fstab
-
-if [ "$FS" != "zfs-root" ]; then
-    UUID_SWAP=$(blkid -s UUID -o value "$SWAP_PART")
-    echo "UUID=$UUID_SWAP none            swap    sw                      0 0" >> /mnt/gentoo/etc/fstab
-fi
 
 echo "hostname=\"gentoo\"" > /mnt/gentoo/etc/conf.d/hostname
 ln -sf /usr/share/zoneinfo/UTC /mnt/gentoo/etc/localtime
@@ -219,7 +210,7 @@ emerge -uDU --keep-going @world
 if [ "$BOOTLOADER" = "systemd-boot" ]; then
     bootctl install
     KVER=$(uname -r)
-    UUID_ROOT=$(blkid -s UUID -o value /dev/sda3)
+    UUID_ROOT=$(blkid -s UUID -o value /dev/sda2)
     cat > /boot/loader/entries/gentoo.conf <<INNEREOF
 title Gentoo Linux
 linux /vmlinuz-${KVER}
@@ -232,7 +223,7 @@ timeout 4
 INNEREOF
 elif [ "$BOOTLOADER" = "efistub" ]; then
     KVER=$(uname -r)
-    UUID_ROOT=$(blkid -s UUID -o value /dev/sda3)
+    UUID_ROOT=$(blkid -s UUID -o value /dev/sda2)
     efibootmgr --create --disk /dev/sda --part 1 \
         --loader "/vmlinuz-${KVER}" \
         --label "Gentoo" \
@@ -240,7 +231,7 @@ elif [ "$BOOTLOADER" = "efistub" ]; then
 fi
 
 echo "root:gentoo" | chpasswd
-log "✅ Установка завершена! Пароль root: 'gentoo' (смените после входа)."
+log "✅ Установка завершена! Пароль root: 'gentoo' (СМЕНИТЕ ПОСЛЕ ВХОДА!)"
 EOF
 
 chmod +x /mnt/gentoo/root/install-chroot.sh
