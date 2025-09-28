@@ -138,7 +138,7 @@ mount "$EFI" /mnt/gentoo/boot/efi
 # === Загрузка stage3 ===
 log "Получение списка stage3..."
 
-LISTING_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64-${PROFILE}.txt"
+LISTING_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-${PROFILE}.txt"
 LISTING_CONTENT=$(curl -s --max-time 10 "$LISTING_URL")
 
 if [ -z "$LISTING_CONTENT" ]; then
