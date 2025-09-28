@@ -113,11 +113,15 @@ else
     mkswap "$SWAP_PART"
     swapon "$SWAP_PART"
     mkfs.btrfs -f "$ROOT_PART"
+
+    # Создаём временную точку монтирования
+    mkdir -p /mnt/btrfs-tmp
     mount "$ROOT_PART" /mnt/btrfs-tmp
 
     btrfs subvolume create /mnt/btrfs-tmp/@
     btrfs subvolume create /mnt/btrfs-tmp/@home
     umount /mnt/btrfs-tmp
+    rmdir /mnt/btrfs-tmp  # опционально: удаляем после использования
 
     mkdir -p /mnt/gentoo
     mount -o subvol=@,compress=zstd,noatime "$ROOT_PART" /mnt/gentoo
