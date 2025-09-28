@@ -1,280 +1,208 @@
 #!/bin/bash
-set -euo pipefail
 
-# === Настройки ===
+set -e
+
+# Проверка root
+if [[ $EUID -ne 0 ]]; then
+    echo "Запустите скрипт от root"
+    exit 1
+fi
+
+# Установка переменных
 DISK="/dev/sda"
-EFI_SIZE="512M"
+BOOT_SIZE="+512M"
+MOUNT_POINT="/mnt/gentoo"
 
-# Зеркала Gentoo (в порядке приоритета)
-MIRRORS=(
-    "https://distfiles.gentoo.org"
-    "https://mirror.yandex.ru/gentoo-distfiles"
-    "https://ftp.fau.de/gentoo"
-    "https://gentoo.c3sl.ufpr.br"
-)
-
-# Цвета
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-log() { echo -e "${GREEN}[INFO]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
-
-# === Подготовка: отключаем swap и размонтируем ===
-cleanup() {
-    swapoff -a 2>/dev/null || true
-    umount /dev/sda* 2>/dev/null || true
-    umount /mnt/gentoo* 2>/dev/null || true
-}
-cleanup
-
-# === Проверка: LiveCD? ===
-check_live() {
-    ROOT_FS=$(findmnt -n -o FSTYPE / 2>/dev/null || echo "unknown")
-    case "$ROOT_FS" in
-        squashfs|overlay|tmpfs|ramfs|iso9660|cramfs) ;;
-        ext4|btrfs|xfs|zfs|f2fs)
-            error "Корневая ФС — $ROOT_FS. Запускайте из LiveCD!"
-            ;;
-        *)
-            warn "Неизвестная ФС: $ROOT_FS. Убедитесь, что вы в LiveCD."
-            read -p "Продолжить? (y/N): " -n1 -r
-            echo
-            [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
-            ;;
+# Функция выбора init системы
+choose_init() {
+    echo "Выберите init систему:"
+    echo "1) OpenRC"
+    echo "2) systemd"
+    read -p "Введите 1 или 2: " init_choice
+    case $init_choice in
+        1) INIT="openrc" ;;
+        2) INIT="systemd" ;;
+        *) echo "Неверный выбор"; exit 1 ;;
     esac
 }
-check_live
 
-# === Проверка UEFI ===
-[ -d /sys/firmware/efi ] || error "Требуется UEFI."
+# Функция выбора ФС
+choose_fs() {
+    echo "Выберите файловую систему:"
+    echo "1) btrfs (с подтомами)"
+    echo "2) ZFS root"
+    read -p "Введите 1 или 2: " fs_choice
+    case $fs_choice in
+        1) FS="btrfs" ;;
+        2) FS="zfs" ;;
+        *) echo "Неверный выбор"; exit 1 ;;
+    esac
+}
 
-# === Сеть ===
-log "Проверка интернета..."
-if ! ping -c1 -W3 8.8.8.8 &>/dev/null; then
-    error "Нет интернета. Настройте сеть (например: dhcpcd)."
+# Функция выбора загрузчика
+choose_bootloader() {
+    echo "Выберите загрузчик:"
+    echo "1) systemd-boot"
+    echo "2) EFISTUB"
+    read -p "Введите 1 или 2: " boot_choice
+    case $boot_choice in
+        1) BOOTLOADER="systemd-boot" ;;
+        2) BOOTLOADER="efistub" ;;
+        *) echo "Неверный выбор"; exit 1 ;;
+    esac
+}
+
+# Подтверждение
+echo "ВНИМАНИЕ: Это полностью очистит $DISK!"
+read -p "Продолжить? (y/N): " confirm
+if [[ $confirm != [yY] ]]; then
+    exit 0
 fi
-if ! ping -c1 -W3 distfiles.gentoo.org &>/dev/null; then
-    warn "DNS работает, но distfiles.gentoo.org не пингуется — возможно, временные проблемы."
-fi
 
-# === Выбор конфигурации ===
-log "Выберите init-систему:"
-select INIT in "systemd" "openrc"; do
-    [[ "$INIT" = "systemd" || "$INIT" = "openrc" ]] && break
-    echo "Неверный выбор"
-done
+# Вызов функций выбора
+choose_init
+choose_fs
+choose_bootloader
 
-log "Выберите корневую ФС:"
-select FS in "btrfs-subvol" "zfs-root"; do
-    [[ "$FS" = "btrfs-subvol" || "$FS" = "zfs-root" ]] && break
-    echo "Неверный выбор"
-done
-
-# Профиль для stage3
-if [ "$INIT" = "systemd" ]; then
-    PROFILE="systemd"
-    BOOTLOADER="systemd-boot"
+# Подготовка диска
+echo "Разметка диска..."
+sgdisk --zap-all $DISK
+sgdisk -n1:0:+512M -t1:ef00 -c1:"EFI System" $DISK
+if [[ "$FS" == "zfs" ]]; then
+    sgdisk -n2:0:0 -t2:bf01 -c2:"ZFS" $DISK
 else
-    PROFILE="openrc"      # ← КЛЮЧЕВОЕ: не "default"!
-    BOOTLOADER="efistub"
+    sgdisk -n2:0:0 -t2:8300 -c2:"Root" $DISK
 fi
 
-log "Конфигурация: init=$INIT, profile=$PROFILE, fs=$FS, bootloader=$BOOTLOADER"
+partprobe $DISK
 
-# === Разметка диска (без swap) ===
-log "Разметка $DISK..."
-sgdisk --zap-all "$DISK" &>/dev/null || true
-sleep 2
+EFI_PARTITION="${DISK}1"
+ROOT_PARTITION="${DISK}2"
 
-if [ "$FS" = "zfs-root" ]; then
-    sgdisk -n1:0:+$EFI_SIZE -t1:ef00 -c1:"EFI" "$DISK"
-    sgdisk -n2:0:0       -t2:bf00 -c2:"ZFS" "$DISK"
-else
-    sgdisk -n1:0:+$EFI_SIZE -t1:ef00 -c1:"EFI" "$DISK"
-    sgdisk -n2:0:0        -t2:8300 -c2:"root" "$DISK"
+# Форматирование
+mkfs.fat -F32 $EFI_PARTITION
+
+if [[ "$FS" == "btrfs" ]]; then
+    mkfs.btrfs $ROOT_PARTITION
+    mount $ROOT_PARTITION $MOUNT_POINT
+    btrfs subvolume create $MOUNT_POINT/root
+    btrfs subvolume create $MOUNT_POINT/home
+    umount $MOUNT_POINT
+    mount -o subvol=root $ROOT_PARTITION $MOUNT_POINT
+    mkdir -p $MOUNT_POINT/{boot,home}
+    mount $EFI_PARTITION $MOUNT_POINT/boot
+    mount -o subvol=home $ROOT_PARTITION $MOUNT_POINT/home
+elif [[ "$FS" == "zfs" ]]; then
+    zpool create -f -o ashift=12 -O compression=lz4 -O xattr=sa -O acl=posix rootpool $ROOT_PARTITION
+    zfs create -o mountpoint=legacy rootpool/ROOT
+    zfs create -o mountpoint=legacy rootpool/home
+    mount -t zfs rootpool/ROOT $MOUNT_POINT
+    mkdir -p $MOUNT_POINT/{boot,home}
+    mount $EFI_PARTITION $MOUNT_POINT/boot
+    mount -t zfs rootpool/home $MOUNT_POINT/home
 fi
 
-partprobe "$DISK"
-sleep 3
+# Скачивание stage3 и установка
+echo "Выбор архива stage3..."
+STAGE3_URL=$(curl -s https://distfiles.gentoo.org/releases/amd64/autobuilds/latest-stage3-amd64.txt | grep -v "^#" | head -n1 | awk '{print $1}')
+wget -O stage3.tar.xz "https://distfiles.gentoo.org/releases/amd64/autobuilds/$STAGE3_URL"
 
-# === Форматирование ===
-EFI="${DISK}1"
-ROOT="${DISK}2"
-ZFS_PART="${DISK}2"
+# Распаковка
+tar xpvf stage3.tar.xz -C $MOUNT_POINT --xattrs-include='*.*' --numeric-owner
 
-if [ "$FS" = "zfs-root" ]; then
-    modprobe zfs || error "ZFS не поддерживается в этом LiveCD."
-    zpool create -f -o ashift=12 \
-        -O compression=zstd -O atime=off -O xattr=sa -O normalization=formD \
-        -O mountpoint=none rpool "$ZFS_PART"
-    zfs create -o mountpoint=legacy rpool/ROOT
-    zfs create -o mountpoint=legacy rpool/home
-    mkdir -p /mnt/gentoo
-    mount -t zfs rpool/ROOT /mnt/gentoo
-    mkdir -p /mnt/gentoo/home
-    mount -t zfs rpool/home /mnt/gentoo/home
-else
-    mkfs.vfat -F32 "$EFI"
-    mkfs.btrfs -f "$ROOT"
-    mkdir -p /mnt/btrfs-tmp
-    mount "$ROOT" /mnt/btrfs-tmp
-    btrfs subvolume create /mnt/btrfs-tmp/@
-    btrfs subvolume create /mnt/btrfs-tmp/@home
-    umount /mnt/btrfs-tmp
-    rmdir /mnt/btrfs-tmp
-    mkdir -p /mnt/gentoo
-    mount -o subvol=@,compress=zstd,noatime "$ROOT" /mnt/gentoo
-    mkdir -p /mnt/gentoo/home
-    mount -o subvol=@home,compress=zstd,noatime "$ROOT" /mnt/gentoo/home
-fi
+# Копирование DNS
+cp /etc/resolv.conf $MOUNT_POINT/etc/
 
-mkdir -p /mnt/gentoo/boot/efi
-mount "$EFI" /mnt/gentoo/boot/efi
+# Монтирование системных директорий
+mount --types proc /proc $MOUNT_POINT/proc
+mount --rbind /sys $MOUNT_POINT/sys
+mount --make-rslave $MOUNT_POINT/sys
+mount --rbind /dev $MOUNT_POINT/dev
+mount --make-rslave $MOUNT_POINT/dev
 
-# === Загрузка stage3 ===
-log "Получение списка stage3..."
-
-LISTING_URL="https://distfiles.gentoo.org/releases/amd64/autobuilds/current-stage3-amd64-${PROFILE}.txt"
-LISTING_CONTENT=$(curl -s --max-time 10 "$LISTING_URL")
-
-if [ -z "$LISTING_CONTENT" ]; then
-    error "Не удалось загрузить список stage3. Проверьте зеркала:\n$LISTING_URL"
-fi
-
-STAGE3_FILE=$(echo "$LISTING_CONTENT" | grep -v '^#' | head -n1 | awk '{print $1}')
-[ -z "$STAGE3_FILE" ] && error "Не удалось определить имя stage3."
-
-log "Найден файл: $STAGE3_FILE"
-
-# Скачивание с резервных зеркал
-stage3_ok=false
-for MIRROR in "${MIRRORS[@]}"; do
-    log "Пробую: $MIRROR"
-    if wget -q --timeout=15 "$MIRROR/releases/amd64/autobuilds/$STAGE3_FILE" -O /mnt/gentoo/stage3.tar.xz; then
-        stage3_ok=true
-        break
-    fi
-done
-
-[ "$stage3_ok" = false ] && error "Не удалось скачать stage3 ни с одного зеркала."
-
-cd /mnt/gentoo
-tar xpf stage3.tar.xz --xattrs-include='*.*' --numeric-owner
-rm -f stage3.tar.xz
-log "Stage3 установлен."
-
-# === fstab ===
-cat > /mnt/gentoo/etc/fstab <<EOF
-# <device>        <mountpoint>    <type>  <options>               <dump/pass>
-EOF
-
-if [ "$FS" = "zfs-root" ]; then
-    echo "rpool/ROOT      /               zfs     defaults                0 0" >> /mnt/gentoo/etc/fstab
-    echo "rpool/home      /home           zfs     defaults                0 0" >> /mnt/gentoo/etc/fstab
-else
-    UUID=$(blkid -s UUID -o value "$ROOT")
-    echo "UUID=$UUID      /               btrfs   subvol=@,compress=zstd,noatime  0 0" >> /mnt/gentoo/etc/fstab
-    echo "UUID=$UUID      /home           btrfs   subvol=@home,compress=zstd,noatime 0 0" >> /mnt/gentoo/etc/fstab
-fi
-
-UUID_EFI=$(blkid -s UUID -o value "$EFI")
-echo "UUID=$UUID_EFI  /boot/efi       vfat    defaults                0 2" >> /mnt/gentoo/etc/fstab
-
-# === Базовая настройка ===
-echo "hostname=\"gentoo\"" > /mnt/gentoo/etc/conf.d/hostname
-ln -sf /usr/share/zoneinfo/UTC /mnt/gentoo/etc/localtime
-mkdir -p /mnt/gentoo/etc/portage/repos.conf
-cp /mnt/gentoo/usr/share/portage/config/repos.conf /mnt/gentoo/etc/portage/repos.conf/gentoo.conf
-echo 'MAKEOPTS="-j$(nproc)"' >> /mnt/gentoo/etc/portage/make.conf
-
-# === Chroot-скрипт ===
-cat > /mnt/gentoo/root/install-chroot.sh <<'EOF'
+# Копирование скрипта для chroot
+cat > $MOUNT_POINT/root/setup-chroot.sh <<EOF
 #!/bin/bash
-set -euo pipefail
-log() { echo -e "\033[0;32m[INFO]\033[0m $1"; }
+export PS1="(chroot) $PS1"
 
-emerge --sync --quiet
-emerge sys-kernel/gentoo-sources sys-apps/pciutils
+# Выбор профиля
+eselect profile set default/linux/amd64/17.1
 
-cd /usr/src/linux
-make defconfig
-scripts/config --enable CONFIG_MODULES
-scripts/config --enable CONFIG_EFI
-scripts/config --enable CONFIG_EFI_STUB
-scripts/config --enable CONFIG_BINFMT_SCRIPT
+# Обновление портежа
+emerge --sync
+emerge --verbose --update --deep --newuse @world
 
-if [ "$FS" = "zfs-root" ]; then
-    scripts/config --module CONFIG_ZFS
+# Установка системных пакетов
+emerge sys-kernel/linux-firmware
+emerge sys-kernel/genkernel
+
+# Настройка fstab
+genfstab -U $MOUNT_POINT >> /etc/fstab
+
+# Установка ядра
+if [[ "$FS" == "zfs" ]]; then
+    echo 'zfs' >> /etc/portage/make.conf
     emerge sys-fs/zfs
-elif [ "$FS" = "btrfs-subvol" ]; then
-    scripts/config --enable CONFIG_BTRFS_FS
+    genkernel --kernel-config=/etc/kernels/kernel-config-$(uname -r) all
+else
+    genkernel all
 fi
 
-make -j$(nproc) modules_prepare
-make -j$(nproc) modules
-make modules_install
-make install
+# Настройка часового пояса
+echo "Europe/Moscow" > /etc/timezone
+emerge --config sys-libs/timezone-data
 
-# Initramfs
-if [ "$FS" = "zfs-root" ] || [ "$FS" = "btrfs-subvol" ]; then
-    emerge sys-kernel/dracut
-    dracut --force --kmoddir /lib/modules/$(uname -r)
+# Настройка локали
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+echo "ru_RU.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+eselect locale set ru_RU.UTF-8
+
+env-update && source /etc/profile
+
+# Установка init системы
+if [[ "$INIT" == "openrc" ]]; then
+    emerge sys-apps/openrc
+    eselect rc update
+    rc-update add sshd default
+    rc-update add dhcpcd default
+    echo 'rc_controller_cgroups="YES"' >> /etc/rc.conf
+else
+    echo 'GRUB_PLATFORMS="efi-64"' >> /etc/portage/make.conf
+    emerge sys-boot/systemd
 fi
 
-emerge -uDU --keep-going @world
-
-# Загрузчик
-if [ "$BOOTLOADER" = "systemd-boot" ]; then
-    bootctl install
-    KVER=$(uname -r)
-    UUID=$(blkid -s UUID -o value /dev/sda2)
-    cat > /boot/loader/entries/gentoo.conf <<INNEREOF
-title Gentoo Linux
-linux /vmlinuz-${KVER}
-initrd /initramfs-${KVER}.img
-options root=UUID=${UUID} rootflags=subvol=@ rw
-INNEREOF
-    cat > /boot/loader/loader.conf <<INNEREOF
-default gentoo
-timeout 4
-INNEREOF
-elif [ "$BOOTLOADER" = "efistub" ]; then
-    KVER=$(uname -r)
-    UUID=$(blkid -s UUID -o value /dev/sda2)
-    efibootmgr --create --disk /dev/sda --part 1 \
-        --loader "/vmlinuz-${KVER}" \
-        --label "Gentoo" \
-        --unicode "root=UUID=${UUID} rootflags=subvol=@ rw initrd=\\\\initramfs-${KVER}.img"
+# Установка загрузчика
+if [[ "$BOOTLOADER" == "systemd-boot" ]]; then
+    if [[ "$INIT" == "systemd" ]]; then
+        bootctl install
+        cat > /boot/loader/entries/gentoo.conf <<BOOTCONF
+title    Gentoo Linux
+linux    /vmlinuz-linux
+initrd   /initramfs-linux.img
+options  root=PARTUUID=\$(blkid -s PARTUUID -o value $ROOT_PARTITION) rootfstype=\$([[ "$FS" == "zfs" ]] && echo zfs || echo btrfs) \$([[ "$FS" == "btrfs" ]] && echo "subvol=root")
+BOOTCONF
+    fi
+elif [[ "$BOOTLOADER" == "efistub" ]]; then
+    # EFISTUB использует efibootmgr
+    echo "Настройка EFISTUB..."
+    # Вручную или через efibootmgr
+    # Это требует дополнительных действий в live-среде
+    # Пока что просто добавим в fstab
+    echo "Для EFISTUB настройте efibootmgr вручную."
 fi
 
-echo "root:gentoo" | chpasswd
-log "✅ Установка завершена! Пароль: 'gentoo' (СМЕНИТЕ!)"
+# Установка пароля root
+passwd
+
 EOF
 
-chmod +x /mnt/gentoo/root/install-chroot.sh
+chmod +x $MOUNT_POINT/root/setup-chroot.sh
 
-# Передача переменных
-cat > /mnt/gentoo/root/env.sh <<EOF
-export FS='$FS'
-export BOOTLOADER='$BOOTLOADER'
-EOF
+# Вход в chroot и выполнение скрипта
+chroot $MOUNT_POINT /root/setup-chroot.sh
 
-# Монтируем псевдо-ФС
-mount --types proc /proc /mnt/gentoo/proc
-mount --rbind /sys /mnt/gentoo/sys
-mount --make-rslave /mnt/gentoo/sys
-mount --rbind /dev /mnt/gentoo/dev
-mount --make-rslave /mnt/gentoo/dev
-cp -L /etc/resolv.conf /mnt/gentoo/etc/
+# Удаление скрипта
+rm $MOUNT_POINT/root/setup-chroot.sh
 
-# Запуск
-chroot /mnt/gentoo /bin/bash -c "source /root/env.sh && /root/install-chroot.sh"
-
-log "✅ Установка Gentoo завершена!"
-log "🔁 Выполните:"
-log "   umount -R /mnt/gentoo"
-log "   reboot"
+echo "Установка завершена! Выгрузите файловые системы и перезагрузитесь."
