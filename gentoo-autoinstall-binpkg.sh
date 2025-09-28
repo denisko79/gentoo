@@ -1,4 +1,4 @@
-#!/bin/bash
+-#!/bin/bash
 set -euo pipefail
 
 # === Настройки ===
@@ -61,13 +61,16 @@ select FS in "btrfs-subvol" "zfs-root"; do
     echo "Неверный выбор"
 done
 
+# === ОБЯЗАТЕЛЬНО: определяем PROFILE здесь ===
 if [ "$INIT" = "systemd" ]; then
+    PROFILE="systemd"
     BOOTLOADER="systemd-boot"
 else
+    PROFILE="default"
     BOOTLOADER="efistub"
 fi
 
-log "Конфигурация: init=$INIT, fs=$FS, bootloader=$BOOTLOADER"
+log "Конфигурация: init=$INIT, profile=$PROFILE, fs=$FS, bootloader=$BOOTLOADER"
 
 # === 1. Разметка диска (БЕЗ swap) ===
 log "Очистка и разметка $DISK (только EFI + корень)..."
