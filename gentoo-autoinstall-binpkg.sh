@@ -25,10 +25,19 @@ error() {
     exit 1
 }
 
-# Проверка: запущен ли в chroot?
-if [ -f /etc/gentoo-release ]; then
-    error "Скрипт должен запускаться из LiveCD/USB, а не из chroot!"
+# Проверка: не в chroot ли мы?
+# В chroot /proc/1/root указывает НЕ на /
+if [ -d /proc/1/root ] && [ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root/proc 2>/dev/null || echo '0:0')" ]; then
+    error "Обнаружен chroot! Скрипт должен запускаться из LiveCD/USB."
 fi
+
+# Дополнительно: если корневая ФС — это /dev/sda*, то точно не LiveCD
+ROOT_DEV=$(findmnt -n -o SOURCE /)
+case "$ROOT_DEV" in
+    /dev/sda*|/dev/nvme0n1p*|/dev/mmcblk0p*)
+        error "Корневая ФС — $ROOT_DEV. Похоже, вы в установленной системе, а не в LiveCD!"
+        ;;
+esac
 
 # Проверка UEFI
 if [ ! -d /sys/firmware/efi ]; then
